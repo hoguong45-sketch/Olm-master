@@ -24,10 +24,8 @@ DEFAULT_HEADERS = {
 app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
 app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 
-# Lưu phiên đăng nhập theo session_id:
-# { session_id: {"cookies": dict, "csrf_token": str, "username": str, "created_at": float, "last_seen": float} }
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SECONDS = 60 * 60 * 12  # 12 giờ
+SESSION_TTL_SECONDS = 60 * 60 * 12
 
 
 def _cleanup_sessions() -> None:
@@ -38,7 +36,6 @@ def _cleanup_sessions() -> None:
 
 
 def _extract_csrf_token(html: str, cookies_dict: Dict[str, str]) -> str:
-    # 1. Tìm input hidden _token trong HTML
     patterns = [
         r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
         r'value=["\']([^"\']+)["\'][^>]*name=["\']_token["\']',
@@ -50,7 +47,6 @@ def _extract_csrf_token(html: str, cookies_dict: Dict[str, str]) -> str:
         if m and m.group(1).strip():
             return m.group(1).strip()
 
-    # 2. Fallback sang XSRF-TOKEN trong cookie nếu có
     xsrf = cookies_dict.get("XSRF-TOKEN") or cookies_dict.get("xsrf-token")
     if xsrf:
         return requests.utils.unquote(xsrf)
@@ -73,18 +69,16 @@ def _is_logged_in_html(html: str, final_url: str = "") -> bool:
     lower = (html or "").lower()
     if "/dangnhap" in (final_url or "").lower():
         return False
-    # Nếu còn cả ô username lẫn password của form đăng nhập thì coi như chưa vào phiên
     if 'name="password"' in lower and 'name="username"' in lower:
+        return False
+    if "otp-code-field" in lower:
         return False
     if any(marker in lower for marker in ["dang-xuat", "đăng xuất", "logout", "lớp học của tôi", "hoc-sinh"]):
         return True
-    return len(lower.strip()) > 0
+    return False
 
 
 def olm_authenticate(username: str, password: str) -> Dict[str, Any]:
-    """
-    Đăng nhập thực tế vào https://olm.vn/dangnhap và trả về dict thông tin phiên.
-    """
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
     session.headers["Referer"] = LOGIN_URL
@@ -117,21 +111,20 @@ def olm_authenticate(username: str, password: str) -> Dict[str, Any]:
     cookies_after = requests.utils.dict_from_cookiejar(session.cookies)
     final_csrf = _extract_csrf_token(post_res.text, cookies_after) or csrf_token
 
-    # Kiểm tra chắc chắn bằng cách truy cập trang chủ sau đăng nhập
     verify_res = session.get(f"{OLM_BASE_URL}/", headers=session.headers, timeout=15, allow_redirects=True)
     cookies_verified = requests.utils.dict_from_cookiejar(session.cookies)
     final_csrf = _extract_csrf_token(verify_res.text, cookies_verified) or final_csrf
 
     if not _is_logged_in_html(verify_res.text, verify_res.url):
-        # Kiểm tra thêm xem post_res có trả JSON báo lỗi không
-        detail = "Sai tài khoản OLM hoặc OLM yêu cầu xác minh thêm"
-        try:
-            j = post_res.json()
-            if isinstance(j, dict) and (j.get("message") or j.get("error")):
-                detail = str(j.get("message") or j.get("error"))
-        except Exception:
-            pass
-        return {"ok": False, "error": detail}
+        debug_info = {
+            "post_status": post_res.status_code,
+            "post_url": str(post_res.url),
+            "post_text_head": (post_res.text or "")[:180],
+            "verify_url": str(verify_res.url),
+            "verify_status": verify_res.status_code,
+            "cookies": list(cookies_verified.keys()),
+        }
+        return {"ok": False, "error": f"Đăng nhập thất bại ({debug_info})"}
 
     return {
         "ok": True,
