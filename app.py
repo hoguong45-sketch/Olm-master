@@ -1,412 +1,332 @@
 import os
+import re
 import time
 import uuid
+from typing import Any, Dict, Optional
+from urllib.parse import urljoin
+
+from flask import Flask, jsonify, make_response, request, send_from_directory
 import requests
-from flask import Flask, request, jsonify, send_from_directory
 
-app = Flask(__name__, static_folder=".", static_url_path="")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OLM_BASE_URL = "https://olm.vn"
+LOGIN_URL = f"{OLM_BASE_URL}/dangnhap"
 
-OLM_BASE = "https://olm.vn"
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "application/json, text/html, */*;q=0.8",
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
-# Lưu phiên tạm thời trong bộ nhớ (nên chuyển sang SQLite/Redis/DB khi chạy lâu dài)
-SESSIONS = {}        # token -> {"username": ..., "cookies": {...}, "created_at": ...}
-REFRESH_TOKENS = {}  # rtoken -> {"username": ..., "cookies": {...}}
-USERS = {}           # username -> thông tin tài khoản, lượt, gói
+app = Flask(__name__, static_folder=BASE_DIR, static_url_path="")
+app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24).hex())
+
+# Lưu phiên đăng nhập theo session_id:
+# { session_id: {"cookies": dict, "csrf_token": str, "username": str, "created_at": float, "last_seen": float} }
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+SESSION_TTL_SECONDS = 60 * 60 * 12  # 12 giờ
 
 
-def get_token():
-    return request.headers.get("X-Token", "").strip()
+def _cleanup_sessions() -> None:
+    now = time.time()
+    expired = [sid for sid, data in SESSIONS.items() if now - data.get("last_seen", 0) > SESSION_TTL_SECONDS]
+    for sid in expired:
+        SESSIONS.pop(sid, None)
 
 
-def get_session():
-    tok = get_token()
-    if not tok:
-        return None
-    return SESSIONS.get(tok)
+def _extract_csrf_token(html: str, cookies_dict: Dict[str, str]) -> str:
+    # 1. Tìm input hidden _token trong HTML
+    patterns = [
+        r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']_token["\']',
+        r'name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']',
+        r'content=["\']([^"\']+)["\'][^>]*name=["\']csrf-token["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+
+    # 2. Fallback sang XSRF-TOKEN trong cookie nếu có
+    xsrf = cookies_dict.get("XSRF-TOKEN") or cookies_dict.get("xsrf-token")
+    if xsrf:
+        return requests.utils.unquote(xsrf)
+    return ""
 
 
-def build_olm_session(cookies=None):
+def _build_session_from_store(store_entry: Dict[str, Any]) -> requests.Session:
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15",
-        "Referer": OLM_BASE + "/",
-    })
-    if cookies:
-        s.cookies.update(cookies)
+    s.headers.update(DEFAULT_HEADERS)
+    for k, v in store_entry.get("cookies", {}).items():
+        s.cookies.set(k, v, domain="olm.vn")
+    csrf = store_entry.get("csrf_token") or ""
+    if csrf:
+        s.headers["X-CSRF-TOKEN"] = csrf
+        s.headers["X-XSRF-TOKEN"] = csrf
     return s
 
 
-def olm_authenticate(username, password):
-    """
-    Nối logic đăng nhập thật vào OLM tại đây.
-    Trả về (ok: bool, msg: str, cookies: dict).
-    """
-    s = build_olm_session()
-    try:
-        s.get(OLM_BASE + "/dang-nhap", timeout=15)
-        resp = s.post(
-            OLM_BASE + "/dang-nhap",
-            data={"username": username, "password": password},
-            timeout=15,
-            allow_redirects=True,
-        )
-        if resp.status_code == 200 and "dang-xuat" in resp.text.lower():
-            return True, "Đăng nhập thành công", requests.utils.dict_from_cookiejar(s.cookies)
-        return False, "Sai tài khoản OLM hoặc OLM yêu cầu xác minh thêm", {}
-    except requests.RequestException:
-        return False, "Không kết nối được tới OLM", {}
+def _is_logged_in_html(html: str, final_url: str = "") -> bool:
+    lower = (html or "").lower()
+    if "/dangnhap" in (final_url or "").lower():
+        return False
+    # Nếu còn cả ô username lẫn password của form đăng nhập thì coi như chưa vào phiên
+    if 'name="password"' in lower and 'name="username"' in lower:
+        return False
+    if any(marker in lower for marker in ["dang-xuat", "đăng xuất", "logout", "lớp học của tôi", "hoc-sinh"]):
+        return True
+    return len(lower.strip()) > 0
 
 
-def olm_check_alive(cookies):
+def olm_authenticate(username: str, password: str) -> Dict[str, Any]:
     """
-    Kiểm tra phiên OLM còn sống hay bị đăng nhập ở nơi khác.
-    Trả về (alive: bool, relogin: bool, msg: str).
+    Đăng nhập thực tế vào https://olm.vn/dangnhap và trả về dict thông tin phiên.
     """
-    if not cookies:
-        return False, True, "Phiên OLM đã hết hạn"
-    s = build_olm_session(cookies)
-    try:
-        resp = s.get(OLM_BASE + "/", timeout=10, allow_redirects=False)
-        if resp.status_code in (301, 302) and "dang-nhap" in (resp.headers.get("Location") or ""):
-            return False, True, "Bạn vừa đăng nhập nơi khác, vui lòng đăng nhập lại"
-        return True, False, ""
-    except requests.RequestException:
-        return True, False, ""
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    session.headers["Referer"] = LOGIN_URL
+
+    get_res = session.get(LOGIN_URL, timeout=15, allow_redirects=True)
+    cookies_initial = requests.utils.dict_from_cookiejar(session.cookies)
+    csrf_token = _extract_csrf_token(get_res.text, cookies_initial)
+
+    payload: Dict[str, str] = {
+        "username": username,
+        "password": password,
+        "remember": "1",
+    }
+    if csrf_token:
+        payload["_token"] = csrf_token
+
+    post_headers = dict(session.headers)
+    if csrf_token:
+        post_headers["X-CSRF-TOKEN"] = csrf_token
+        post_headers["X-XSRF-TOKEN"] = csrf_token
+
+    post_res = session.post(
+        LOGIN_URL,
+        data=payload,
+        headers=post_headers,
+        timeout=15,
+        allow_redirects=True,
+    )
+
+    cookies_after = requests.utils.dict_from_cookiejar(session.cookies)
+    final_csrf = _extract_csrf_token(post_res.text, cookies_after) or csrf_token
+
+    # Kiểm tra chắc chắn bằng cách truy cập trang chủ sau đăng nhập
+    verify_res = session.get(f"{OLM_BASE_URL}/", headers=session.headers, timeout=15, allow_redirects=True)
+    cookies_verified = requests.utils.dict_from_cookiejar(session.cookies)
+    final_csrf = _extract_csrf_token(verify_res.text, cookies_verified) or final_csrf
+
+    if not _is_logged_in_html(verify_res.text, verify_res.url):
+        # Kiểm tra thêm xem post_res có trả JSON báo lỗi không
+        detail = "Sai tài khoản OLM hoặc OLM yêu cầu xác minh thêm"
+        try:
+            j = post_res.json()
+            if isinstance(j, dict) and (j.get("message") or j.get("error")):
+                detail = str(j.get("message") or j.get("error"))
+        except Exception:
+            pass
+        return {"ok": False, "error": detail}
+
+    return {
+        "ok": True,
+        "cookies": cookies_verified,
+        "csrf_token": final_csrf,
+        "username": username,
+    }
 
 
-def ensure_user(username):
-    if username not in USERS:
-        USERS[username] = {
-            "uname": username,
-            "tier": "free",               # "free" | "vip" | "ultra"
-            "remain": 5,
-            "exam_remain": 0,
-            "total": 5,
-            "max_keys": 2,
-            "first_verified": 1,
-            "is_new_user": False,
-            "new_user_bonus_done": True,
-            "sub_tier": "",
-            "sub_remaining_days": 0,
-            "sub_end_date": "",
-            "keys_used_today": 0,
-            "notifications": [],
-        }
-    return USERS[username]
+def _get_active_session() -> Optional[requests.Session]:
+    _cleanup_sessions()
+    sid = request.headers.get("X-Session-Id") or request.cookies.get("olm_master_sid")
+    if not sid:
+        data = request.get_json(silent=True) or {}
+        sid = data.get("session_id")
+    if not sid or sid not in SESSIONS:
+        return None
+    SESSIONS[sid]["last_seen"] = time.time()
+    return _build_session_from_store(SESSIONS[sid])
 
 
 @app.route("/")
-def serve_index():
-    return send_from_directory(".", "1008.html")
+def index():
+    html_path = os.path.join(BASE_DIR, "1008.html")
+    if os.path.exists(html_path):
+        return send_from_directory(BASE_DIR, "1008.html")
+    return jsonify({"status": "ok", "message": "OLM Master backend running"}), 200
 
 
-@app.post("/api/login")
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok", "timestamp": int(time.time())})
+
+
+@app.route("/api/login", methods=["POST"])
 def api_login():
-    data = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip().lower()
-    password = (data.get("password") or "").strip()
-    remember = bool(data.get("remember"))
+    body = request.get_json(silent=True) or request.form.to_dict() or {}
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
 
     if not username or not password:
-        return jsonify({"ok": False, "msg": "Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu"})
+        return jsonify({"success": False, "message": "Vui lòng nhập đầy đủ tên đăng nhập và mật khẩu"}), 400
 
-    ok, msg, cookies = olm_authenticate(username, password)
-    if not ok:
-        return jsonify({"ok": False, "msg": msg})
+    try:
+        auth_result = olm_authenticate(username, password)
+    except requests.RequestException as exc:
+        return jsonify({"success": False, "message": f"Lỗi kết nối tới OLM: {exc}"}), 502
 
-    u = ensure_user(username)
-    token = uuid.uuid4().hex
-    rtoken = uuid.uuid4().hex if remember else ""
+    if not auth_result.get("ok"):
+        return jsonify({"success": False, "message": auth_result.get("error") or "Đăng nhập thất bại"}), 401
 
-    SESSIONS[token] = {
-        "username": username,
-        "cookies": cookies,
-        "created_at": int(time.time()),
+    _cleanup_sessions()
+    sid = uuid.uuid4().hex
+    now = time.time()
+    SESSIONS[sid] = {
+        "cookies": auth_result["cookies"],
+        "csrf_token": auth_result["csrf_token"],
+        "username": auth_result["username"],
+        "created_at": now,
+        "last_seen": now,
     }
-    if rtoken:
-        REFRESH_TOKENS[rtoken] = {
-            "username": username,
-            "cookies": cookies,
-        }
 
-    return jsonify({
-        "ok": True,
-        "token": token,
-        "rtoken": rtoken,
-        "uname": u["uname"],
-        "tier": u["tier"],
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-        "total": u["total"],
-        "max_keys": u["max_keys"],
-        "first_verified": u["first_verified"],
-        "is_new_user": u["is_new_user"],
-        "new_user_bonus_done": u["new_user_bonus_done"],
-        "sub_tier": u["sub_tier"],
-        "sub_remaining_days": u["sub_remaining_days"],
-        "sub_end_date": u["sub_end_date"],
-    })
+    resp = make_response(
+        jsonify(
+            {
+                "success": True,
+                "message": "Đăng nhập OLM thành công",
+                "session_id": sid,
+                "username": username,
+            }
+        )
+    )
+    resp.set_cookie("olm_master_sid", sid, httponly=True, samesite="Lax", max_age=SESSION_TTL_SECONDS)
+    return resp
 
 
-@app.post("/api/restore")
-def api_restore():
-    rtok = request.headers.get("X-RToken", "").strip()
-    rec = REFRESH_TOKENS.get(rtok)
-    if not rec:
-        return jsonify({"ok": False, "msg": "Phiên ghi nhớ đăng nhập không tồn tại hoặc đã hết hạn"})
-
-    username = rec["username"]
-    u = ensure_user(username)
-    token = uuid.uuid4().hex
-    SESSIONS[token] = {
-        "username": username,
-        "cookies": rec.get("cookies") or {},
-        "created_at": int(time.time()),
-    }
-    return jsonify({
-        "ok": True,
-        "token": token,
-        "uname": u["uname"],
-        "tier": u["tier"],
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-        "total": u["total"],
-        "max_keys": u["max_keys"],
-        "first_verified": u["first_verified"],
-        "sub_tier": u["sub_tier"],
-        "sub_remaining_days": u["sub_remaining_days"],
-        "sub_end_date": u["sub_end_date"],
-    })
-
-
-@app.post("/api/logout")
+@app.route("/api/logout", methods=["POST"])
 def api_logout():
-    tok = get_token()
-    rtok = request.headers.get("X-RToken", "").strip()
-    if tok:
-        SESSIONS.pop(tok, None)
-    if rtok:
-        REFRESH_TOKENS.pop(rtok, None)
-    return jsonify({"ok": True})
+    body = request.get_json(silent=True) or {}
+    sid = request.headers.get("X-Session-Id") or request.cookies.get("olm_master_sid") or body.get("session_id")
+    if sid and sid in SESSIONS:
+        SESSIONS.pop(sid, None)
+    resp = make_response(jsonify({"success": True, "message": "Đã đăng xuất phiên"}))
+    resp.delete_cookie("olm_master_sid")
+    return resp
 
 
-@app.get("/api/keep-alive")
-def api_keep_alive():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "relogin": True, "msg": "Phiên đăng nhập đã hết hạn"})
-    alive, relogin, msg = olm_check_alive(sess.get("cookies"))
-    if not alive:
-        return jsonify({"ok": False, "relogin": relogin, "msg": msg})
-    return jsonify({"ok": True})
+@app.route("/api/check-session", methods=["GET", "POST"])
+def api_check_session():
+    s = _get_active_session()
+    if not s:
+        return jsonify({"authenticated": False}), 200
+    return jsonify({"authenticated": True}), 200
 
 
-@app.post("/api/validate-token")
-def api_validate_token():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False})
-    u = ensure_user(sess["username"])
-    return jsonify({
-        "ok": True,
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-        "sub_remaining_days": u["sub_remaining_days"],
-        "sub_end_date": u["sub_end_date"],
-        "sub_tier": u["sub_tier"],
-    })
-
-
-@app.get("/api/assignments")
+@app.route("/api/assignments", methods=["GET", "POST"])
 def api_assignments():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
+    s = _get_active_session()
+    if not s:
+        return jsonify({"success": False, "message": "Phiên đăng nhập đã hết hạn hoặc chưa đăng nhập"}), 401
 
-    pages = max(1, min(100, int(request.args.get("pages", 3))))
-    mode = request.args.get("mode", "pending")
+    classes_data: Any = None
+    courseware_data: Any = None
 
-    # Nối logic quét danh sách bài từ OLM theo pages và mode ("pending" | "all")
-    sample_items = []
-    return jsonify({"ok": True, "assignments": sample_items, "pages": pages, "mode": mode})
+    candidate_endpoints = [
+        ("classes", f"{OLM_BASE_URL}/api/student/list-classes-of-student"),
+        ("classes", f"{OLM_BASE_URL}/list-classes-of-student"),
+        ("courseware", f"{OLM_BASE_URL}/api/student/list-courseware-of-student"),
+        ("courseware", f"{OLM_BASE_URL}/list-courseware-of-student"),
+    ]
 
+    for kind, url in candidate_endpoints:
+        try:
+            r = s.get(url, timeout=15)
+            if r.status_code == 200:
+                try:
+                    parsed = r.json()
+                    if kind == "classes" and classes_data is None:
+                        classes_data = parsed
+                    elif kind == "courseware" and courseware_data is None:
+                        courseware_data = parsed
+                except ValueError:
+                    continue
+        except requests.RequestException:
+            continue
 
-@app.post("/api/solve")
-def api_solve():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-
-    u = ensure_user(sess["username"])
-    body = request.get_json(silent=True) or {}
-    assignment = body.get("assignment") or {}
-    is_exam = bool(assignment.get("is_kiem_tra") or assignment.get("is_kiem_tra_pdf"))
-
-    if is_exam and u["tier"] != "ultra":
-        if (u.get("exam_remain") or 0) <= 0:
-            return jsonify({"ok": False, "msg": "Hết lượt bài kiểm tra", "remain": u["remain"], "exam_remain": u["exam_remain"]})
-        u["exam_remain"] -= 1
-    elif u["tier"] == "free":
-        if (u.get("remain") or 0) <= 0:
-            return jsonify({"ok": False, "msg": "Hết lượt bài tập", "remain": u["remain"], "exam_remain": u["exam_remain"]})
-        u["remain"] -= 1
-
-    # Nối logic giải & nộp bài lên OLM dựa trên assignment và tham số tùy chọn
-    return jsonify({
-        "ok": True,
-        "msg": "Đã giải xong bài",
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-    })
+    return jsonify(
+        {
+            "success": True,
+            "classes": classes_data,
+            "courseware": courseware_data,
+        }
+    )
 
 
-@app.post("/api/exam-info")
+@app.route("/api/exam-info", methods=["GET", "POST"])
 def api_exam_info():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
+    s = _get_active_session()
+    if not s:
+        return jsonify({"success": False, "message": "Chưa đăng nhập phiên OLM"}), 401
 
-    body = request.get_json(silent=True) or {}
-    url = (body.get("url") or "").strip()
+    data = request.get_json(silent=True) or request.args.to_dict() or {}
+    target_url = (data.get("url") or data.get("link") or "").strip()
+    if not target_url:
+        return jsonify({"success": False, "message": "Thiếu url/link bài làm"}), 400
 
-    # Nối logic nhận diện dạng bài từ link OLM
-    exam_type = "kiem_tra" if "kiem-tra" in url or "de-thi" in url else ("video" if "video" in url else "bai_tap")
-    return jsonify({
-        "ok": True,
-        "exam_type": exam_type,
-        "total_questions": 0,
-    })
+    full_url = urljoin(OLM_BASE_URL, target_url)
+    try:
+        res = s.get(full_url, timeout=15, allow_redirects=True)
+        return jsonify(
+            {
+                "success": True,
+                "url": res.url,
+                "status_code": res.status_code,
+                "html_length": len(res.text),
+            }
+        )
+    except requests.RequestException as exc:
+        return jsonify({"success": False, "message": f"Không thể tải thông tin bài: {exc}"}), 502
 
 
-@app.post("/api/solve-link")
+@app.route("/api/solve", methods=["POST"])
+def api_solve():
+    s = _get_active_session()
+    if not s:
+        return jsonify({"success": False, "message": "Chưa đăng nhập phiên OLM"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    return jsonify(
+        {
+            "success": True,
+            "message": "Đã nhận yêu cầu /api/solve",
+            "received": payload,
+        }
+    )
+
+
+@app.route("/api/solve-link", methods=["POST"])
 def api_solve_link():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
+    s = _get_active_session()
+    if not s:
+        return jsonify({"success": False, "message": "Chưa đăng nhập phiên OLM"}), 401
 
-    u = ensure_user(sess["username"])
-    body = request.get_json(silent=True) or {}
-    url = (body.get("url") or "").strip()
-    if not url:
-        return jsonify({"ok": False, "msg": "Link trống"})
+    payload = request.get_json(silent=True) or {}
+    link = (payload.get("link") or payload.get("url") or "").strip()
+    if not link:
+        return jsonify({"success": False, "message": "Vui lòng cung cấp đường dẫn bài học/bài kiểm tra"}), 400
 
-    if u["tier"] == "free":
-        if (u.get("remain") or 0) <= 0:
-            return jsonify({"ok": False, "msg": "Hết lượt bài tập", "remain": u["remain"], "exam_remain": u["exam_remain"]})
-        u["remain"] -= 1
-
-    # Nối logic giải bài theo url và tham số tùy chọn trong body
-    return jsonify({
-        "ok": True,
-        "msg": "Đã xử lý link",
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-    })
-
-
-@app.post("/api/exam/info")
-def api_exam_info_by_id():
-    if not get_session():
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-    return jsonify({"ok": True, "nq": 0})
-
-
-@app.get("/api/key/status")
-def api_key_status():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False})
-    u = ensure_user(sess["username"])
-    used = u["keys_used_today"]
-    left = max(0, u["max_keys"] - used)
-    return jsonify({
-        "ok": True,
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-        "keys_used": used,
-        "keys_left": left,
-    })
-
-
-@app.post("/api/key/start")
-def api_key_start():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-    u = ensure_user(sess["username"])
-    if u["keys_used_today"] >= u["max_keys"]:
-        return jsonify({"ok": False, "msg": "Bạn đã tạo tối đa 2 key hôm nay"})
-    return jsonify({"ok": True, "link": "https://olm.vn"})
-
-
-@app.post("/api/key/verify")
-def api_key_verify():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-    u = ensure_user(sess["username"])
-    key = ((request.get_json(silent=True) or {}).get("key") or "").strip()
-    if not key:
-        return jsonify({"ok": False, "msg": "Vui lòng nhập key"})
-    if u["keys_used_today"] >= u["max_keys"]:
-        return jsonify({"ok": False, "msg": "Đã hết lượt kích hoạt key hôm nay"})
-
-    u["keys_used_today"] += 1
-    u["remain"] = (u.get("remain") or 0) + 5
-    return jsonify({
-        "ok": True,
-        "remain": u["remain"],
-        "exam_remain": u["exam_remain"],
-    })
-
-
-@app.post("/api/canva/request")
-def api_canva_request():
-    if not get_session():
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-    email = ((request.get_json(silent=True) or {}).get("email") or "").strip()
-    if "@" not in email:
-        return jsonify({"ok": False, "msg": "Email không hợp lệ"})
-    return jsonify({"ok": True})
-
-
-@app.post("/api/feedback")
-def api_feedback():
-    if not get_session():
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-    text = ((request.get_json(silent=True) or {}).get("text") or "").strip()
-    if not text:
-        return jsonify({"ok": False, "msg": "Nội dung trống"})
-    return jsonify({"ok": True})
-
-
-@app.post("/api/giftcode/redeem")
-def api_giftcode_redeem():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False, "msg": "Chưa đăng nhập"})
-    u = ensure_user(sess["username"])
-    code = ((request.get_json(silent=True) or {}).get("code") or "").strip().upper()
-    if not code:
-        return jsonify({"ok": False, "msg": "Mã code trống"})
-    u["remain"] = (u.get("remain") or 0) + 3
-    return jsonify({"ok": True, "bonus": "+3 lượt", "remain": u["remain"]})
-
-
-@app.get("/api/notifications")
-def api_notifications():
-    sess = get_session()
-    if not sess:
-        return jsonify({"ok": False})
-    u = ensure_user(sess["username"])
-    return jsonify({"ok": True, "notifications": u["notifications"], "unread": 0})
-
-
-@app.post("/api/notifications/read")
-def api_notifications_read():
-    if not get_session():
-        return jsonify({"ok": False})
-    return jsonify({"ok": True})
+    return jsonify(
+        {
+            "success": True,
+            "message": "Đã nhận liên kết xử lý",
+            "link": urljoin(OLM_BASE_URL, link),
+        }
+    )
 
 
 if __name__ == "__main__":
