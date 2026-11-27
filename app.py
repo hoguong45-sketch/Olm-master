@@ -2,6 +2,7 @@ import os
 import re
 import time
 import uuid
+import cloudscraper
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin
 
